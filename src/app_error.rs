@@ -32,6 +32,9 @@ impl IntoResponse for AppError {
             AppError::SpotifyError(SpotifyError::NotFoundPlayingItem) => {
                 (StatusCode::NO_CONTENT, "Not playing").into_response()
             }
+            AppError::SpotifyError(SpotifyError::NoCredentials) => {
+                (StatusCode::INTERNAL_SERVER_ERROR,"Internal server error").into_response()
+            }
             AppError::ClientError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             }
@@ -42,4 +45,6 @@ impl IntoResponse for AppError {
 pub enum SpotifyError {
     #[warn(dead_code)]
     NotFoundPlayingItem,
+    #[warn(dead_code)]
+    NoCredentials,
 }

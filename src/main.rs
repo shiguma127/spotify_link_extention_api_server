@@ -1,6 +1,6 @@
 use app_error::{AppError, SpotifyError};
 use async_redis_session::RedisSessionStore;
-use async_session::{async_trait, log::debug, Session, SessionStore};
+use async_session::{Session, SessionStore, async_trait, chrono::{Duration, Utc}};
 use axum::{
     body::{Bytes, Empty},
     extract::{Extension, FromRequest, Query, RequestParts, TypedHeader},
@@ -13,6 +13,7 @@ use hyper::{
     header::{self, SET_COOKIE},
     Body, HeaderMap, Response, StatusCode,
 };
+use once_cell::sync::OnceCell;
 use rspotify::{
     clients::{BaseClient, OAuthClient},
     model::{AdditionalType, PlayableItem},
@@ -24,6 +25,8 @@ use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
 mod app_error;
 static COOKIE_NAME: &str = "SESSION";
+
+static CREDENTIALS : OnceCell<Credentials> = OnceCell::new();
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -52,12 +55,14 @@ async fn main() {
     let cofig_path = get_config_path().expect("Could not find config file");
     let config_string = fs::read_to_string(cofig_path).expect("Unable to read config.toml");
     let config: Config = toml::from_str(&config_string).expect("Unable to parse config.toml");
-    let redis_session_store = RedisSessionStore::new(config.radisserver_url).unwrap();
+    let redis_session_store = RedisSessionStore::new(config.radisserver_url).expect("Unable to create redis session store");
     //initilize Spotify Client
     let credentials = Credentials {
         id: config.client_id,
         secret: Some(config.client_secret),
     };
+
+    CREDENTIALS.set(credentials.clone()).unwrap();
 
     let oauth = OAuth {
         redirect_uri: config.callback_url,
@@ -95,7 +100,12 @@ struct User {
 }
 
 async fn index(user: User) -> Result<impl IntoResponse, AppError> {
-    let spotify = AuthCodeSpotify::from_token(user.token);
+    let mut spotify = AuthCodeSpotify::from_token(user.token);
+    spotify.creds = match CREDENTIALS.get() {
+        Some(creds) => creds.clone(),
+        None => return Err(AppError::SpotifyError(SpotifyError::NoCredentials)),
+    };
+    spotify.config.token_refreshing = true;
     let result = spotify
         .current_playback(
             None,
@@ -125,6 +135,20 @@ async fn login_handler(Extension(spotify_client): Extension<AuthCodeSpotify>) ->
     )
 }
 
+async fn expire_token<S: BaseClient>(spotify: &S) {
+    let token_mutex = spotify.get_token();
+    let mut token = token_mutex.lock().await.unwrap();
+    let mut token = token.as_mut().expect("Token can't be empty as this point");
+    // In a regular case, the token would expire with time. Here we just do
+    // it manually.
+    let now = Utc::now().checked_sub_signed(Duration::seconds(10));
+    token.expires_at = now;
+    token.expires_in = Duration::seconds(0);
+    // We also use a garbage access token to make sure it's actually
+    // refreshed.
+    token.access_token = "garbage".to_owned();
+}
+
 #[derive(Debug, Deserialize)]
 struct AuthRequest {
     code: String,
@@ -137,7 +161,6 @@ async fn callback_handler(
 ) -> impl IntoResponse {
     let code = query.code.clone();
     let mut spotify = spotify_client.clone();
-    debug!("code: {}", code);
     spotify.request_token(&code).await.unwrap();
     let token = spotify.get_token().lock().await.unwrap().clone();
     let token = match token {
@@ -192,7 +215,7 @@ where
 {
     type Rejection = AuthRedirect;
     async fn from_request(req: &mut RequestParts<B>) -> std::result::Result<Self, Self::Rejection> {
-        dbg!(&req.headers());
+        //dbg!(&req.headers());
         let Extension(store) = Extension::<RedisSessionStore>::from_request(req)
             .await
             //todo: handle error
